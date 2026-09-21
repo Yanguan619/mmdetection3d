@@ -82,9 +82,10 @@ class BaseViewTransform(nn.Module):
         # undo post-transformation
         # B x N x D x H x W x 3
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
-        points = (
-            torch.inverse(post_rots).view(B, N, 1, 1, 1, 3,
-                                          3).matmul(points.unsqueeze(-1)))
+        B, N, D, H, W, _ = points.shape
+        inv_rot = torch.inverse(post_rots).reshape(B * N, 3, 3)
+        p = points.reshape(B * N, D * H * W, 3).transpose(1, 2)
+        points = torch.bmm(inv_rot, p).transpose(1, 2).reshape(B, N, D, H, W, 3)
         # cam_to_lidar
         points = torch.cat(
             (
@@ -94,15 +95,19 @@ class BaseViewTransform(nn.Module):
             5,
         )
         combine = camera2lidar_rots.matmul(torch.inverse(intrins))
-        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        B, N, D, H, W, _ = points.shape
+        c = combine.reshape(B * N, 3, 3)
+        p = points.reshape(B * N, D * H * W, 3).transpose(1, 2)
+        result = torch.bmm(c, p)
+        points = result.transpose(1, 2).reshape(B, N, D, H, W, 3)
         points += camera2lidar_trans.view(B, N, 1, 1, 1, 3)
 
         if 'extra_rots' in kwargs:
             extra_rots = kwargs['extra_rots']
-            points = (
-                extra_rots.view(B, 1, 1, 1, 1, 3,
-                                3).repeat(1, N, 1, 1, 1, 1, 1).matmul(
-                                    points.unsqueeze(-1)).squeeze(-1))
+            B, N, D, H, W, _ = points.shape
+            extra_rot = extra_rots.reshape(B, 3, 3)
+            p = points.reshape(B, N * D * H * W, 3).transpose(1, 2)
+            points = torch.bmm(extra_rot, p).transpose(1, 2).reshape(B, N, D, H, W, 3)
         if 'extra_trans' in kwargs:
             extra_trans = kwargs['extra_trans']
             points += extra_trans.view(B, 1, 1, 1, 1,
@@ -130,15 +135,25 @@ class BaseViewTransform(nn.Module):
         ])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
-        # filter out points that are outside box
+        # 越界点处理（bit-exact，且省去 1.28GB 的 feats 乘零流量）：
+        # 把越界点坐标映射到网格外哨兵格 (nx[0], nx[1], nx[2]) —— 所有越界点共享
+        # 一个 rank/segment。AscendC kernel 自带 CoordInGrid 越界检查，整段直接
+        # 跳过（连 chunk 都不装载）；QuickCumsum/scatter/CUDA 后端入口做标准
+        # sanitize（bev_pool.py::_sanitize_dense_scatter），哨兵坐标在那里同样
+        # 被识别为越界、贡献恰好 0.0。
+        # 精度：与旧方案（乘 0.0 + clamp 进边缘格）逐位一致 —— fp32 加 0.0 不改值，
+        # 纯越界格两方案都是 0.0（旧：显式写 0.0；新：new_zeros 保持 0）。
         kept = ((geom_feats[:, 0] >= 0)
                 & (geom_feats[:, 0] < self.nx[0])
                 & (geom_feats[:, 1] >= 0)
                 & (geom_feats[:, 1] < self.nx[1])
                 & (geom_feats[:, 2] >= 0)
                 & (geom_feats[:, 2] < self.nx[2]))
-        x = x[kept]
-        geom_feats = geom_feats[kept]
+        geom_feats = torch.cat(
+            [geom_feats[:, :3].where(
+                kept.unsqueeze(1),
+                geom_feats.new_tensor([self.nx[0], self.nx[1], self.nx[2]])),
+             geom_feats[:, 3:]], dim=1)
 
         x = bev_pool(x, geom_feats, B, self.nx[2], self.nx[0], self.nx[1])
 
@@ -277,6 +292,7 @@ class BaseDepthTransform(BaseViewTransform):
         depth = torch.zeros(batch_size, img.shape[1], 1,
                             *self.image_size).to(points[0].device)
 
+        H_img, W_img = self.image_size[0], self.image_size[1]
         for b in range(batch_size):
             cur_coords = points[b][:, :3]
             cur_img_aug_matrix = img_aug_matrix[b]
@@ -300,19 +316,19 @@ class BaseDepthTransform(BaseViewTransform):
             cur_coords += cur_img_aug_matrix[:, :3, 3].reshape(-1, 3, 1)
             cur_coords = cur_coords[:, :2, :].transpose(1, 2)
 
-            # normalize coords for grid sample
+            # normalize coords for grid sample: [..., [1, 0]] -> (y, x)
             cur_coords = cur_coords[..., [1, 0]]
 
-            on_img = ((cur_coords[..., 0] < self.image_size[0])
-                      & (cur_coords[..., 0] >= 0)
-                      & (cur_coords[..., 1] < self.image_size[1])
-                      & (cur_coords[..., 1] >= 0))
-            for c in range(on_img.shape[0]):
-                masked_coords = cur_coords[c, on_img[c]].long()
-                masked_dist = dist[c, on_img[c]]
-                depth = depth.to(masked_dist.dtype)
-                depth[b, c, 0, masked_coords[:, 0],
-                      masked_coords[:, 1]] = masked_dist
+            for c in range(cur_coords.shape[0]):
+                on_img = ((cur_coords[c, :, 0] >= 0)
+                          & (cur_coords[c, :, 0] < H_img)
+                          & (cur_coords[c, :, 1] >= 0)
+                          & (cur_coords[c, :, 1] < W_img))
+                if not on_img.any():
+                    continue
+                yx = cur_coords[c, on_img].long()
+                d = dist[c, on_img]
+                depth[b, c, 0, yx[:, 0], yx[:, 1]] = d
 
         extra_rots = lidar_aug_matrix[..., :3, :3]
         extra_trans = lidar_aug_matrix[..., :3, 3]

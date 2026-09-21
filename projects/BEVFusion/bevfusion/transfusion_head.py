@@ -156,7 +156,8 @@ class TransFusionHead(nn.Module):
             'out_size_factor']
         y_size = self.test_cfg['grid_size'][1] // self.test_cfg[
             'out_size_factor']
-        self.bev_pos = self.create_2D_grid(x_size, y_size)
+        self.register_buffer('bev_pos', self.create_2D_grid(x_size, y_size),
+                             persistent=False)
 
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
@@ -224,7 +225,7 @@ class TransFusionHead(nn.Module):
         #################################
         # query initialization
         #################################
-        with torch.autocast('cuda', enabled=False):
+        with torch.autocast(device_type=inputs.device.type, enabled=False):
             dense_heatmap = self.heatmap_head(fusion_feat.float())
         heatmap = dense_heatmap.detach().sigmoid()
         padding = self.nms_kernel_size // 2
@@ -236,16 +237,16 @@ class TransFusionHead(nn.Module):
                   padding:(-padding)] = local_max_inner
         # for Pedestrian & Traffic_cone in nuScenes
         if self.test_cfg['dataset'] == 'nuScenes':
-            local_max[:, 8, ] = F.max_pool2d(
-                heatmap[:, 8], kernel_size=1, stride=1, padding=0)
-            local_max[:, 9, ] = F.max_pool2d(
-                heatmap[:, 9], kernel_size=1, stride=1, padding=0)
+            local_max[:, 8:9, ] = F.max_pool2d(
+                heatmap[:, 8:9], kernel_size=1, stride=1, padding=0)
+            local_max[:, 9:10, ] = F.max_pool2d(
+                heatmap[:, 9:10], kernel_size=1, stride=1, padding=0)
         elif self.test_cfg[
                 'dataset'] == 'Waymo':  # for Pedestrian & Cyclist in Waymo
-            local_max[:, 1, ] = F.max_pool2d(
-                heatmap[:, 1], kernel_size=1, stride=1, padding=0)
-            local_max[:, 2, ] = F.max_pool2d(
-                heatmap[:, 2], kernel_size=1, stride=1, padding=0)
+            local_max[:, 1:2, ] = F.max_pool2d(
+                heatmap[:, 1:2], kernel_size=1, stride=1, padding=0)
+            local_max[:, 2:3, ] = F.max_pool2d(
+                heatmap[:, 2:3], kernel_size=1, stride=1, padding=0)
         heatmap = heatmap * (heatmap == local_max)
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
@@ -293,7 +294,8 @@ class TransFusionHead(nn.Module):
             ret_dicts.append(res_layer)
 
             # for next level positional embedding
-            query_pos = res_layer['center'].detach().clone().permute(0, 2, 1)
+            query_pos = res_layer['center'].detach().clone().permute(
+                0, 2, 1)
 
         ret_dicts[0]['query_heatmap_score'] = heatmap.gather(
             index=top_proposals_index[:,
