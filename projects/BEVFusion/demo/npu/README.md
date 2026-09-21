@@ -2,7 +2,7 @@
 
 BEVFusion 在昇腾 310P 上的全 PyTorch 推理 demo 与全量评测工具链。
 
-- 性能结论：**0.62s/帧**（`[TIME] inference` = `model.test_step` 纯前向，不含数据/权重加载）
+- 性能结论：**0.54s/帧**（`[TIME] inference` = `model.test_step` 纯前向，不含数据/权重加载；2026-09-21 npu:0 实测；npu:7 共享设备噪声 ~0.70s，A/B 须同卡同时段）
 - 精度结论：**全量 6019 帧 val 集 mAP 68.74 / NDS 71.49**，与官方 GPU 基线一致（100.2% / 100.1%）
 - 详细分析见 [`性能.md`](性能.md)（profiling + 优化轨迹）与 [`精度.md`](精度.md)（验证记录 + 补丁清单）
 
@@ -99,5 +99,5 @@ python projects/BEVFusion/demo/npu/npu_eval.py \
 | `run_npu_test_chunks.sh` | 分块驱动 + 合并脚本 |
 | `npu_eval.py` | NuScenesEval（NDS/mAP/ATE/ASE/AOE/AVE/AAE） |
 | `npu_patches.py` | NPU 精度/性能补丁（spconv 替换、Swin、get_geometry） |
-| `性能.md` | 性能分析详情（profiling、优化轨迹 57s→0.62s、bev_pool A/B） |
+| `性能.md` | 性能分析详情（profiling、优化轨迹 57s→0.54s、bev_pool A/B） |
 | `精度.md` | 精度验证详情（全量/单帧/补丁清单/复测方法） |
