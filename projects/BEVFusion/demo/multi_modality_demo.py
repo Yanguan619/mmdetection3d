@@ -1,11 +1,22 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
+import sys
 from argparse import ArgumentParser
 
 import mmcv
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 
 from mmdet3d.apis import inference_multi_modality_detector, init_model
 from mmdet3d.registry import VISUALIZERS
 
+torch.npu.set_compile_mode(jit_compile=False)
+
+# 自动把 spconv 包加入 sys.path（OpenPCDet/ 目录 -> ../unum_ops/src/unum_ops）
+_PKG_ROOT = os.path.normpath("/data/workspace/unum_ops/src/unum_ops")
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
 
 def parse_args():
     parser = ArgumentParser()
@@ -15,7 +26,7 @@ def parse_args():
     parser.add_argument('config', help='Config file')
     parser.add_argument('checkpoint', help='Checkpoint file')
     parser.add_argument(
-        '--device', default='cuda:0', help='Device used for inference')
+        '--device', default='npu:0', help='Device used for inference')
     parser.add_argument(
         '--cam-type',
         type=str,

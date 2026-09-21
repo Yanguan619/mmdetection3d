@@ -2,29 +2,99 @@ import torch
 from torch import nn
 from torch.autograd import Function
 
-from .voxel_layer import (dynamic_point_to_voxel_backward,
-                          dynamic_point_to_voxel_forward)
+try:
+    from .voxel_layer import (dynamic_point_to_voxel_backward,
+                              dynamic_point_to_voxel_forward)
+    _HAS_EXT = True
+except (ImportError, ModuleNotFoundError):
+    _HAS_EXT = False
+
+
+def _dynamic_point_to_voxel_forward_pytorch(feats, coors, reduce_type):
+    num_input = feats.size(0)
+    num_feats = feats.size(1)
+
+    if num_input == 0:
+        return (feats.clone().detach(), coors.clone().detach(),
+                coors.new_empty((0, ), dtype=torch.int32),
+                coors.new_empty((0, ), dtype=torch.int32))
+
+    coors_clean = coors.masked_fill(coors.lt(0).any(-1, True), -1)
+    out_coors, inverse, reduce_count = torch.unique(
+        coors_clean, dim=0, return_inverse=True, return_counts=True)
+
+    if out_coors.shape[0] > 0 and out_coors[0, 0] < 0:
+        out_coors = out_coors[1:]
+        reduce_count = reduce_count[1:]
+        inverse = inverse - 1
+
+    coors_map = inverse.to(torch.int32)
+    reduce_count = reduce_count.to(torch.int32)
+
+    reduced_feats = torch.zeros((out_coors.size(0), num_feats),
+                                dtype=feats.dtype,
+                                device=feats.device)
+    if coors_map.numel() > 0:
+        if reduce_type == 'max':
+            reduced_feats = reduced_feats.scatter_reduce(
+                0,
+                coors_map.unsqueeze(1).expand(-1, num_feats),
+                feats,
+                reduce='amax',
+                include_self=True)
+        elif reduce_type == 'sum':
+            reduced_feats = reduced_feats.scatter_add(
+                0, coors_map.unsqueeze(1).expand(-1, num_feats), feats)
+        elif reduce_type == 'mean':
+            reduced_feats = reduced_feats.scatter_add(
+                0, coors_map.unsqueeze(1).expand(-1, num_feats), feats)
+            reduced_feats /= reduce_count.unsqueeze(-1).to(feats.dtype)
+        else:
+            raise NotImplementedError(f'reduce_type {reduce_type} not '
+                                      f'supported')
+
+    return reduced_feats, out_coors, coors_map, reduce_count
+
+
+def _dynamic_point_to_voxel_backward_pytorch(grad_feats, grad_reduced_feats,
+                                             feats, reduced_feats, coors_map,
+                                             reduce_count, reduce_type):
+    grad_feats.fill_(0)
+    num_input = feats.size(0)
+    num_reduced = reduced_feats.size(0)
+    num_feats = feats.size(1)
+
+    if num_input == 0 or num_reduced == 0:
+        return
+
+    coors_map = coors_map.to(torch.long)
+    if reduce_type in ('mean', 'sum'):
+        if reduce_type == 'mean':
+            grad_reduced_feats = grad_reduced_feats / \
+                reduce_count.unsqueeze(-1).to(grad_reduced_feats.dtype)
+        grad_feats = grad_feats.scatter_add(
+            0, coors_map.unsqueeze(1).expand(-1, num_feats),
+            grad_reduced_feats[coors_map])
+    elif reduce_type == 'max':
+        max_vals = reduced_feats[coors_map]
+        is_max = (feats == max_vals)
+        grad_scatter = grad_reduced_feats[coors_map] * is_max.to(
+            grad_reduced_feats.dtype)
+        grad_feats = grad_feats.scatter_add(
+            0, coors_map.unsqueeze(1).expand(-1, num_feats), grad_scatter)
+    else:
+        raise NotImplementedError(f'reduce_type {reduce_type} not supported')
 
 
 class _dynamic_scatter(Function):
 
     @staticmethod
     def forward(ctx, feats, coors, reduce_type='max'):
-        """convert kitti points(N, >=3) to voxels.
-
-        Args:
-            feats: [N, C] float tensor. points features to be reduced
-                into voxels.
-            coors: [N, ndim] int tensor. corresponding voxel coordinates
-                (specifically multi-dim voxel index) of each points.
-            reduce_type: str. reduce op. support 'max', 'sum' and 'mean'
-        Returns:
-            tuple
-            voxel_feats: [M, C] float tensor. reduced features. input features
-                that shares the same voxel coordinates are reduced to one row
-            coordinates: [M, ndim] int tensor, voxel coordinates.
-        """
-        results = dynamic_point_to_voxel_forward(feats, coors, reduce_type)
+        if _HAS_EXT:
+            results = dynamic_point_to_voxel_forward(feats, coors, reduce_type)
+        else:
+            results = _dynamic_point_to_voxel_forward_pytorch(
+                feats, coors, reduce_type)
         (voxel_feats, voxel_coors, point2voxel_map,
          voxel_points_count) = results
         ctx.reduce_type = reduce_type
@@ -38,17 +108,20 @@ class _dynamic_scatter(Function):
         (feats, voxel_feats, point2voxel_map,
          voxel_points_count) = ctx.saved_tensors
         grad_feats = torch.zeros_like(feats)
-        # TODO: whether to use index put or use cuda_backward
-        # To use index put, need point to voxel index
-        dynamic_point_to_voxel_backward(
-            grad_feats,
-            grad_voxel_feats.contiguous(),
-            feats,
-            voxel_feats,
-            point2voxel_map,
-            voxel_points_count,
-            ctx.reduce_type,
-        )
+        if _HAS_EXT:
+            dynamic_point_to_voxel_backward(
+                grad_feats,
+                grad_voxel_feats.contiguous(),
+                feats,
+                voxel_feats,
+                point2voxel_map,
+                voxel_points_count,
+                ctx.reduce_type,
+            )
+        else:
+            _dynamic_point_to_voxel_backward_pytorch(
+                grad_feats, grad_voxel_feats.contiguous(), feats, voxel_feats,
+                point2voxel_map, voxel_points_count, ctx.reduce_type)
         return grad_feats, None, None
 
 
@@ -59,19 +132,6 @@ class DynamicScatter(nn.Module):
 
     def __init__(self, voxel_size, point_cloud_range, average_points: bool):
         super(DynamicScatter, self).__init__()
-        """Scatters points into voxels, used in the voxel encoder with
-           dynamic voxelization
-
-        **Note**: The CPU and GPU implementation get the same output, but
-        have numerical difference after summation and division (e.g., 5e-7).
-
-        Args:
-            average_points (bool): whether to use avg pooling to scatter
-                points into voxel voxel_size (list): list [x, y, z] size
-                of three dimension
-            point_cloud_range (list):
-                [x_min, y_min, z_min, x_max, y_max, z_max]
-        """
         self.voxel_size = voxel_size
         self.point_cloud_range = point_cloud_range
         self.average_points = average_points
@@ -81,10 +141,6 @@ class DynamicScatter(nn.Module):
         return dynamic_scatter(points.contiguous(), coors.contiguous(), reduce)
 
     def forward(self, points, coors):
-        """
-        Args:
-            input: NC points
-        """
         if coors.size(-1) == 3:
             return self.forward_single(points, coors)
         else:
