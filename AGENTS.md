@@ -384,21 +384,40 @@ env 开启后包络不满足或 ext 加载失败直接 RuntimeError，不再静�
   C32→64 101ms、C16→32 63ms；前段形状反而快（SubM C16 @1440×1440×41 仅 7.4ms）。
   推断 v2 kernel tiling 按 spatial 分块并行，spatial 小（Z=5/11）→ tile 数少 → 核数利用崩塌，
   而每行 GEMM（K×C×C）恰在后段最大。`benchmark/output/Performance_spconv_v2*.csv` 未覆盖
-  小 spatial 形状，属 bench 盲区，补 bench 需加 360×360×11 / 180×180×5 @ C64/C128。
+  小 spatial 形状，属 bench 盲区。**已补（2026-09-29 傍晚）**：`benchmark/bench_spconv.py`
+  （同日合并：bench_spconv.py + bench_spconv_v2.py + 剔除 v1 死段，僵尸文件
+  bench_spconv_ascendc.py 删除；bench_spconv_compare.py 也于同日删除——它是 09-17
+  "方案 A（设备建邻居表）vs 方案 C（CPU 建+按设备缓存）"的已结案设计实验，
+  结论方案 A 胜出并已落进 conv.py（"全程在 out_coords 所在设备完成，不再强制
+  .cpu()"），其方案 C 是 monkey-patch 的冻结旧 sort+searchsorted 副本，与三口径
+  实现轴无关；benchmark 下 spconv bench 只保留一个文件，历史见 git）。
+  test/ 下 spconv 测试亦同日五合一：test_spconv.py ← test_spconv_v2 /
+  convref_v2 / v2_hier / v2_strict，六段结构（torch 模块层 / v1 gemm /
+  TestV2Kernel 内核层 / TestV2Dispatch 分发层 / TestV2Hier 优化路径回归 /
+  TestV2Strict 严格模式），合并前后 122 项用例逐一对应，历史见 git。
+  spconv bench 统一三口径（torch 冷 hostK1 / torch 热 conv_ref 缓存 / AscendC-v2），
+  含 `bench_demo_shapes`（聚簇数据 9 实帧形状）/`bench_demo_shapes_rand`（随机对照）。
+  **AscendC 弱 case 现为一等公民**：对热 torch v2 全 case 落后 1.7-20x（npoints 全 N 段
+  2-4x、dim_sweep 1.7-2.9x、demo 形状 4-20x，最差 in1 SubM C5-16 17x / SC 18-20x）；
+  对冷 torch 全 case 占优 1.5-80x。聚簇 vs 随机对 SC 差异达 1.75x（union 行数），
+  两模式都须覆盖。
 - **张量级精度健康**：v2 vs torch 在全部 4 个 stage 形状 + SC/gate/conv_out 形状 bit-exact
   （合成数据，`/tmp/opencode/ab_stage_shapes.py`、`ab_large_n.py`；仓库
-  `test/test_spconv_convref_v2.py` 5/5 但只测 n=3000/C16→32，小 N 盲区）。
+  `test/test_spconv.py` TestV2Dispatch（原 test_spconv_convref_v2.py）5/5 但只测
+  n=3000/C16→32，小 N 盲区）。
 - **三次踩坑记录**：
   1. **静默回退陷阱**：ext .so 加载失败时 `_spconv_v2_forward` 缓存失败 → 全层静默回退
      torch，demo 表现为 0.5s/48 dets（与基线几乎相同）——曾误判为"v2 更快"。测 v2 性能必须
      用 gate 计数器确认 v2 实际启用层数（v2=N fallback=0）。**已修复（严格模式）**：
      env 开启后 ext 加载失败/包络不满足（非 NPU、ndim≠3、dilation、SubM 奇核+padding=k//2、
      排序容量超限）一律 RuntimeError 带具体原因，禁止静默回退（用户指令 2026-09-29）；
-     `test/test_spconv_v2_strict.py` 9 项回归覆盖全部报错路径。
+     `test/test_spconv.py` TestV2Strict（原 test_spconv_v2_strict.py）9 项回归覆盖
+     全部报错路径。
   2. **环境变量拼写分叉（第三次踩坑，同日发现）**：v1 的 env 名是 `UNUM_SPCONCV2`
      （spconcv2，多一个 C），而 AGENTS.md 标题/demo 命令习惯写 `UNUM_SPCONV2`——
      两个名字曾同时存在于代码注释、测试和 shell 命令中。后果：仓库测试
-     `test_spconv_convref_v2.py` 的 `subm_k3s1` case **从诞生起空洞通过**（测试设带C名+
+     `test_spconv.py` TestV2Dispatch 的 `subm_k3s1` case（当时位于
+     test_spconv_convref_v2.py）**从诞生起空洞通过**（测试设带C名+
      默认 padding=0 不满足旧 gate 的 p==k//2 检查 → 静默回退 → torch 对 torch 恒真；
      docstring 写着 "p1" 但代码没传 padding=1）。修复：规范名 `UNUM_SPCONV2`，旧拼写
      `UNUM_SPCONCV2` 作为兼容别名（同一开关任一生效）；subm case 补 `padding=1`。
@@ -455,3 +474,38 @@ max_abs ≤8.2e-4 / cos 1.000000 / rows+coords 全等（fp32 hi/lo 3-pass 契约
    "结果对了才崩"的路径
 4. **测量驱动的成本模型迭代**：refill 检查 hoist（预期省一半）实测只省 2ms、
    branchless select 实测只省 ~15%——每轮 profile 校准模型再投放下一轮
+
+#### 16.2 稳定性闭环（2026-09-29 晚）：间歇性精度损坏定位与修复，unum_ops `e5de3cc`
+
+soak（3×50 demo + 10 进程 A/B 重复性）抓到真问题：**rep-6 的 SC_16to32 出现
+features max_abs 4.5e2 / cos 1.4e-3，但 rows/coords 全对**——间歇性（~1/20 进程）、
+空载设备复现（排除并发负载假说）、结构完好仅数值垃圾。20 进程盲复现 0 命中后
+转向代码级取证，签名精确匹配 **staged 返回路径的 `aclrtMemcpyAsync` D2D 静默
+丢弃**（dav-m20 族：调用返回 0 但不执行）：丢掉的拷贝返回 `at::empty` 未初始化
+垃圾、另两路拷贝正常落地（所以 rows/coords 对）。该族异常 launch 侧早有
+receipt+epoch 重试防护，返回拷贝此前零校验；晨间未复现的 7-dets 异常大概率
+同族（返回拷贝丢的是 mDev/outIdx 时症状不同）。
+
+**修复**（全在 `spconv_v2/kernel/pybind11.cpp`，140+/29-）：
+1. `CopySampleEqual`：返回拷贝完成后 dst/src 双 4B 采样比对（偏移 0 + gen 派生
+   偏移，同步 D2H）；不匹配重发拷贝（≤3 次），仍败 TORCH_CHECK 硬错——严格
+   模式下不返回未校验数据；开销实测不可见（A/B 计时零回归）
+2. 二级 launch（sort 双流/单流、sort_pos、sc_fold、merge）的低区 receipt
+   （slot 14-20，内核本就写、此前无人查）接入 `VerifyPipeline`；hier merge 三次
+   launch 拆分 tag 10/11/12——原来同 tag 幂等写入，丢最终归并（mode 2）不可见
+
+**验证闭环**：9 形状 A/B 9/9 全净；合并后 `test_spconv.py` 107 passed（v2 相关
+全过；`TestSpconvGemmOp::test_repeatability` 1/3 偶发挂是 v1 gemm 已知 stride
+bug 的垃圾非确定性，与 v2 无关）；demo E2E 10 loop 48 dets/0.819478；
+**50 进程 forensic soak + 2×20 demo loop：0 损坏 0 误报**（~7500 次 v2 调用零
+虚假重试；修复前同口径 10 进程 1 损坏）。
+
+**当日两个测试环境坑**（已记入 unum_ops AGENTS.md）：
+- `PYTHONPATH=src` 前缀会**覆写** shell 指向 CANN `tbe` 目录的 PYTHONPATH →
+  `No module named 'tbe'` → ACL init 500001，表现为 20/22 大面积假挂（当日两次
+  全红均此因，与代码无关）；unum_ops 是 editable 安装，无需 PYTHONPATH
+- 设备 0 系统占用：NPU 测试跑法 `ASCEND_RT_VISIBLE_DEVICES=7 python -m pytest
+  test/...`（测试内 `npu`=逻辑 0 经 visible 重映射落物理 7）
+
+稳定性口径就此闭环：v2 默认仍关闭（0.71s vs torch 0.49s），后续性能轮目标不变
+（lookup_subm 跨层表共享 ~-100ms/帧、wprep host 缓存 -21ms）。
