@@ -59,6 +59,23 @@
     kernel 回退 3c7c9bd + 仅叠加官方约定改动（OutputOffset/InBounds 两处）。教训：改 AscendC
     kernel 后必须立即重编验证，未构建的提交≠已生效；MTE DataCopy GM→UB 长度必须 32B 对齐
     （不对齐用 DataCopyPad）
+  - **max score 非确定性勘误（2026-09-22）**：同二进制连跑 3 次 demo，max score 在
+    0.819399 / 0.819399 / 0.819478 之间随机翻转（48 dets 稳定）——跨核 SetAtomicAdd 原子累加
+    竞争顺序不定（fp32 重排噪声级 ~8e-5）。因此"48 dets / 0.819399 逐位一致"字面不可达成，
+    有效口径是 **48 dets + max ∈ {0.819399, 0.819478} + 分数在 fp32 重排噪声内**；kernel
+    正确性判据用结构探针（scatter_add 参考 max_abs ~1e-6），不以单次 demo max score 为准
+  - **kernel 内部优化证伪（2026-09-22，分支 bevpool-kernel-opt 已回退）**：
+    - "feats 640MB gather 15ms" 是**过时前提**——wrapper 的 sort+index_select 已在 56b982a 删除，
+      host 端无 gather
+    - "permute 6.4ms" 是 D=41 全分辨率帧的数；本 demo 帧 D=1 网格仅 41.5MB，permute 实测
+      1.0-1.8ms；且消除必回归（kernel 直写 (B,C,D,H,W) 需每点 C=80 次散落原子写，MTE3 流量 ×80）
+    - 唯一可消项（host ranks prep 8.5ms）移入 kernel 逐点循环后 kernel 13.2→23.4ms（+10.2ms），
+      净亏 2-3ms——**AscendC kernel 标量发射受限**，host 向量管线算 rank 远优；未来不要再往
+      kernel 循环里加逐点标量计算
+  - **prep CPU 化证伪（2026-09-22，已回退）**：把量化/kept/ranks 全搬到 CPU（复用 geom stash）
+    实测 **CPU 1.99M 点 prep 150-175ms，比 NPU 上 28.2ms 慢 6x**；且 `_compute_geometry_cpu`
+    ~180ms 已近 Swin 177ms 并行窗口上限，prep 加入后 CPU 串行块超窗成新瓶颈，E2E +150-180ms。
+    NPU 的 int 张量操作比 CPU 快一个数量级，此方向性错误勿再试
 - scatter_add 版对 CPU fp32 是 bit-exact 的，但走 AICPU 逐点累加（~1.84M 点实测
   1.32s/帧），仅作参照；QuickCumsum 版 fp32 求和重排级误差（对检测结果影响 <0.001）
 - **torch_npu `t[:-1] = src` 就地切片赋值 bug**（CANN 25.5.2）：会多写末位元素，
@@ -67,8 +84,19 @@
 
 #### 4. voxelization (`projects/BEVFusion/bevfusion/ops/voxel/voxelize.py`)
 - 纯 torch 向量化实现（`torch.argsort + torch.unique_consecutive`）
-- AscendC 的 `unum_ops.voxelization.voxelization` 在 34 万点以上卡死，不可用
 - argsort 用 int64（float32 会因精度 >2^24 丢失精度）
+- **2026-09-25 起默认走 AscendC**（`_Voxelization.forward` 分发，env `BEVFUSION_VOXEL_BACKEND=
+  torch|ascendc|auto` 门控，auto=NPU 上 ascendc 失败静默回退 torch）：unum_ops v1 重写版
+  （09-24 commit 0a70d9d，v2 内核）24.8 万点实测 31.4ms vs torch 70.4ms，voxels/coords/
+  num_points 对 torch 路径逐位一致（含 5 列特征全保留）；demo E2E 同进程 A/B -39ms
+  （564→525ms），48 dets / 0.819399 逐类一致。接入时两个坑：
+  (1) **09-24 重写从未构建安装**——vendor 包停在 09-15、`_libs` .so 停在 09-21，线上跑的
+  还是旧内核（自测 0/9），重编 custom_opp .run + op_extension .so 后 9/9；9/18 bev_pool
+  "未构建的提交≠已生效"教训重演
+  (2) `VoxelizationOutput` dataclass 有 `__iter__` 无 `__getitem__`——解包可以、`out[0]`
+  会 TypeError，dispatch 里要用属性访问（曾致 auto 静默回退 torch，管线内"102ms"实为
+  回退路径的假象）
+- 旧 AscendC 版（≤09-15 二进制）在 34 万点以上卡死，已被重写版取代
 
 #### 5. 7D matmul (`projects/BEVFusion/bevfusion/depth_lss.py`)
 - NPU 不支持 >6D 张量的 `matmul`，改为 `torch.bmm` + reshape
@@ -309,7 +337,7 @@ python /root/.agents/skills/ascend-onnx-atc-pipeline/scripts/compare_precision.p
 | + AscendC bev_pool（auto 默认） | 0.9-1.2s | demo 级 48 dets 一致 |
 | + O3 热点消除（NonZero/Unique/Index） | 0.7s | 2026-09-18 |
 | + get_geometry numpy 副本预计算 | **0.66s（653-660ms）** | 2026-09-18 下午；几何逐位不变，纯 CPU 补丁的 D2H 排干阻塞净成本 ~37ms 被消除（0.1s 精度计时曾误判为 0） |
-| + bev_pool 包装层快赢（cat 交换/int32 ranks/sort 一次性） | **0.63s（631-639ms）** | 2026-09-18 傍晚；包装 78→48ms（fancy 交换 14→3、int32 ranks 9→5、torch.sort 一次性 33→18、int32 coords gather 7→6）；48 dets / 0.819399 噪声内。坑：int32 直接 sort 落 AICPU 慢 20x（367ms），排序必须 float32。剩余：feats 640MB gather 15ms（kernel 侧索引可消）、sort 18ms（atomic kernel 可消） |
+| + bev_pool 包装层快赢（cat 交换/int32 ranks/sort 一次性） | **0.63s（631-639ms）** | 2026-09-18 傍晚；包装 78→48ms（fancy 交换 14→3、int32 ranks 9→5、torch.sort 一次性 33→18、int32 coords gather 7→6）；48 dets / 0.819399 噪声内。坑：int32 直接 sort 落 AICPU 慢 20x（367ms），排序必须 float32。剩余：feats 640MB gather 15ms（kernel 侧索引可消）、sort 18ms（atomic kernel 可消）｜**2026-09-22 勘误：gather 已在 56b982a 删除（过时前提），kernel 侧优化证伪，见 §3** |
 | + 移除 x/y 交换（kernel 改官方约定） | **0.62s（613-618ms）** | 2026-09-18 晚；unum_ops AscendC kernel 回退至 3c7c9bd+官方约定（coord[0]→H），分发器直用原生 [x,y,z,b]；48 dets / max 0.819478 逐位一致 |
 
 #### 关键修复
@@ -334,3 +362,96 @@ python /root/.agents/skills/ascend-onnx-atc-pipeline/scripts/compare_precision.p
 - 计算内核（Swin 152ms / spconv 70ms / BEV conv 43ms）远小于数据搬运/布局转换——
   310P 优化主战场是 gather/scatter/sort/小算子风暴，不是 GEMM/Conv
 - torchair（default/full）对当前全 PT 路径无收益（device-bound，1.1s 三模式同速同结果）
+
+### 16. UNUM_SPCONV2=1（spconv v2 全融合 AscendC 内核）demo 实测（2026-09-29）
+
+`unum_ops` spconv 新增 v2 全内核路径（`conv_ref.py` 的 `_v2_forward_fn` 能力门，K1 邻居表 +
+K2 gather/GEMM 单 AscendC kernel 融合，`UNUM_SPCONV2=1` 启用；**2026-09-29 起为严格模式**：
+env 开启后包络不满足或 ext 加载失败直接 RuntimeError，不再静默回退 torch）。
+同日午后针对"4-5x 回退"完成一轮 kernel 优化：**demo E2E 2.2-2.4s → 0.71s（3.2x）**，
+精度全程不变；但相对 torch 路径（0.49s）仍慢 ~45%，**默认继续关闭**。
+
+| 配置 | inference/帧 | dets | max score |
+|---|---|---|---|
+| 基线（env 关） | 0.49s | 48 | 0.819478 |
+| UNUM_SPCONV2=1（09-29 晨，优化前） | 2.2-2.4s | 48 | 0.819399-0.819478 |
+| UNUM_SPCONV2=1（09-29 午后，优化后） | **0.71s** | 48 | 0.819478（逐类全同） |
+| 仅 SubM 走 v2 | 1.9s | 48 | 0.819558 |
+| 仅 SC 走 v2 | 0.7s | 48 | 0.819478 |
+
+- **慢点在 demo 后段小 spatial 大 C 形状**（逐层异步计时实测）：SubM C=64 @sp(360,360,11)
+  161ms×4 层、SubM C=128 @sp(180,180,5) 169ms×4 层 ≈ 1.3s/帧，SC C64→128 110ms、
+  C32→64 101ms、C16→32 63ms；前段形状反而快（SubM C16 @1440×1440×41 仅 7.4ms）。
+  推断 v2 kernel tiling 按 spatial 分块并行，spatial 小（Z=5/11）→ tile 数少 → 核数利用崩塌，
+  而每行 GEMM（K×C×C）恰在后段最大。`benchmark/output/Performance_spconv_v2*.csv` 未覆盖
+  小 spatial 形状，属 bench 盲区，补 bench 需加 360×360×11 / 180×180×5 @ C64/C128。
+- **张量级精度健康**：v2 vs torch 在全部 4 个 stage 形状 + SC/gate/conv_out 形状 bit-exact
+  （合成数据，`/tmp/opencode/ab_stage_shapes.py`、`ab_large_n.py`；仓库
+  `test/test_spconv_convref_v2.py` 5/5 但只测 n=3000/C16→32，小 N 盲区）。
+- **三次踩坑记录**：
+  1. **静默回退陷阱**：ext .so 加载失败时 `_spconv_v2_forward` 缓存失败 → 全层静默回退
+     torch，demo 表现为 0.5s/48 dets（与基线几乎相同）——曾误判为"v2 更快"。测 v2 性能必须
+     用 gate 计数器确认 v2 实际启用层数（v2=N fallback=0）。**已修复（严格模式）**：
+     env 开启后 ext 加载失败/包络不满足（非 NPU、ndim≠3、dilation、SubM 奇核+padding=k//2、
+     排序容量超限）一律 RuntimeError 带具体原因，禁止静默回退（用户指令 2026-09-29）；
+     `test/test_spconv_v2_strict.py` 9 项回归覆盖全部报错路径。
+  2. **环境变量拼写分叉（第三次踩坑，同日发现）**：v1 的 env 名是 `UNUM_SPCONCV2`
+     （spconcv2，多一个 C），而 AGENTS.md 标题/demo 命令习惯写 `UNUM_SPCONV2`——
+     两个名字曾同时存在于代码注释、测试和 shell 命令中。后果：仓库测试
+     `test_spconv_convref_v2.py` 的 `subm_k3s1` case **从诞生起空洞通过**（测试设带C名+
+     默认 padding=0 不满足旧 gate 的 p==k//2 检查 → 静默回退 → torch 对 torch 恒真；
+     docstring 写着 "p1" 但代码没传 padding=1）。修复：规范名 `UNUM_SPCONV2`，旧拼写
+     `UNUM_SPCONCV2` 作为兼容别名（同一开关任一生效）；subm case 补 `padding=1`。
+     教训：**带 env 开关的测试必须验证开关真实生效**（严格模式下"通过"即证明启用，
+     回退模式下必须查 gate 计数器）；两个相似命名的 env 是运维陷阱，新算子 env 命名
+     一次定准并 grep 排查拼写分叉。
+  3. **一次未复现的精度崩坏**：早晨首跑曾得 7 dets / max 0.569 / 2.3s，之后 5 次干净复跑
+     均 48 dets 正常；当时机器上有并行 opencode 会话在 unum_ops 上作业（bev_pool_v2），
+     疑似并发 NPU 负载触发 v2 kernel 跨核竞争。上量前需空载 soak 复验。
+- demo 全链路里 v2 净收益为负（torch 路径 spconv 全链 < 40ms/帧 vs v2 单层 161ms），
+  在 tiling 修复小 spatial 并行度之前保持 `UNUM_SPCONV2` 关闭。
+
+#### 16.1 优化轮（2026-09-29 午后）：v2 2.3s → 0.71s
+
+两项 kernel 优化（`csrc/ascend/spconv_v2/kernel/kernel.h`），精度 9 形状全程
+max_abs ≤8.2e-4 / cos 1.000000 / rows+coords 全等（fp32 hi/lo 3-pass 契约不变）：
+
+1. **Cube W 分块驻留 + gemm piece 分桶**：ktot 大时 W 按 KC 分块常驻 L1，每个
+   M-half × chunk 独立 GEMM；piece 列表按 (chunk, half) 计数排序分桶，gather 循环
+   只走当前 chunk 的桶（原来每 chunk 全量扫 piece 表，~85% 迭代是浪费）。
+   门控 `nChk>=4 && cin<=KC && cbCnt<=192 && arena<=196096`——**nChk=2 时构建成本
+   反超收益（SubM_C32 实测 +2.9ms 回归）**，nChk=27 时 -13ms/层（SubM C128
+   29.1→16.3ms）、nChk=7 时 -3ms（C64 24.4→21.3ms）。
+2. **SC okey 分级归并重写**（sort_merge mode 1/2）：chunk 数 >8 时两级归并
+   （8-chunk 组模板归并 → G=⌈nChunks/8⌉ super-run 终归并），关键优化叠加：
+   - mode 1 **全局 rank 窗口跨组行走**（每核 1 个 slice，7 核吃满；原来每核一整组
+     只用 3/7 核，23.1ms → 6.2ms）
+   - **poison 尾快速路径**：okey 流 poison(-1) 对在归并序中严格排尾且全 poison 时
+     退化为按 run 拼接——二分定位各 run 的 poison 边界后跳过 K-scan 直接搬
+     （实测 demo 的 okey poison 占比很低，此项收益小但免费）
+   - **无分支 best-scan**：poison→kGridCells、耗尽 run→INT32_MAX 哨兵分层，三元
+     select 取严格最小（first-run tie = 稳定序，与旧分支逻辑四种 tie 情形逐位等价）；
+     模板每对成本实测 ≈ **~50ns 固定 + ~40ns×K（数据依赖分支）**，K=8 扫描从 352→
+     ~310ns/pair
+   - 合计：SC okey merge **26.6 → 9.65ms（2.75x）**，SC_16to32 全链 40.3→22.2ms
+     （-45%）、SC_64to128 47.7→33.1ms（-31%）
+
+优化后 demo 剩余 v2 大头（下轮目标）：lookup_subm 8.4ms×16 层（torch 路径有跨层
+表共享缓存，v2 每层重建）、lookup_sc 5.7ms、sort_keys_dual 3.3ms；merge 已接近该
+架构地板（总扫描量 ∝ nO×(g+G)×40ns，g≈G≈√chunks 最优 ≈6.8ms）。
+
+**本轮踩坑（通用教训）**：
+1. **rank 空间陷阱**：分级归并 pass A 每组是独立归并，poisonFrom/nValid 是"本次
+   归并局部量"，而 dstPairBase 是 GM 全局写偏移——组内段两者不等（差 gBase），
+   必须独立传 rankBase；否则 group 1/2 提前切 poison 路径 → valid 对乱序拼出 →
+   唯一 out 行数错（12293→7779，host 侧 shape mismatch 而非内核崩溃）
+2. **任意对齐的 int32 GM→UB DataCopy = 507015 MTE burst 崩溃**：poison 拼接初版
+   直接 `DataCopy(out, srcGm, 2*take)`（src 仅 8B 对齐、长度任意）→ aicore
+   exception 0x26。gemm piece gather（fp32、任意对齐）能跑是**不可推广的特例**，
+   int32 拷贝必须走 4-pair 对齐 src + AlignUp8 长度的窗口纪律（与 §3 bev_pool
+   教训同源）
+3. **潜伏崩溃掩蔽**：mode-1 的 rank bug 让 mode 2 拿到垃圾输入、poisonFrom 恰好
+   不触发崩溃路径——数据修对了崩溃才显形。"跑完但结果错"的代码里可能藏着
+   "结果对了才崩"的路径
+4. **测量驱动的成本模型迭代**：refill 检查 hoist（预期省一半）实测只省 2ms、
+   branchless select 实测只省 ~15%——每轮 profile 校准模型再投放下一轮
