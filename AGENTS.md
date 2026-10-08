@@ -1,5 +1,7 @@
 # NPU (Ascend 310P) 适配记录
 
+- 每次性能有变化的时候，都要更新[性能.md](#一览)的表格，方便追踪
+
 ## BEVFusion Demo 在 NPU 上运行
 
 ### 设备环境
@@ -7,7 +9,7 @@
 - torch_npu 2.7.1, CANN 9.0.0
 - 关键依赖: `unum_ops`（纯 torch 稀疏卷积、AscendC bev_pool/voxelization 算子）
 
-### 历史性能（npu_demo.py 旧路径；当前入口为 NPU/demo.py，0.66s/帧，见 §12/§14/§15）
+### 历史性能（npu_demo.py 旧路径；当前入口为 NPU/demo.py，0.45s/帧，见 §12/§14/§15）
 - 推理时间: ~8.3s/frame (0.12 FPS)
 - 检测结果: 15 detections (score > 0.2), max score 0.501（当时代码未含精度补丁，仅作历史记录）
 - 主要瓶颈: view_transform (3.5s), img_backbone (1.5s)
@@ -37,7 +39,10 @@
 
 #### 3. bev_pool (`projects/BEVFusion/bevfusion/ops/`)
 - **当前默认（auto）：CUDA ext → unum_ops 原子加 AscendC → mx_driving → QuickCumsum 四级分发**
-  （`bev_pool()` 内部实现；**2026-09-20 unum_ops kernel 重写为免排序原子加 scatter**：
+  （`bev_pool()` 内部实现；**2026-09-30 起 mmdet3d 侧 env `BEVFUSION_BEV_POOL_IMPL` 选择
+  unum_ops 单入口 impl，默认 `ascendc`=v1 原子加**——demo 帧 D=1 形状下 v2 全融合段级
+  65.4ms vs v1 23.1ms（tiling 未覆盖，+42ms），回切 v1 后 E2E 0.54→0.48s；unum_ops
+  单入口包级默认仍 ascendc_v2（并行会话领地）；**2026-09-20 unum_ops kernel 重写为免排序原子加 scatter**：
   host 预乘元素偏移 ranks（官方约定 `((bD+z)*H+x)*W+y` 再 ×C），kernel 逐点
   SetAtomicAdd + 80-float DataCopy 直写、OOB 零写流量跳过、tile 间 PipeBarrier 串行纪律；
   1.84M 点实测全链 **31.4ms**（ranks 2.5 + op 19.7 + permute 6.4）vs mx_driving 34.4ms、
@@ -339,6 +344,10 @@ python /root/.agents/skills/ascend-onnx-atc-pipeline/scripts/compare_precision.p
 | + get_geometry numpy 副本预计算 | **0.66s（653-660ms）** | 2026-09-18 下午；几何逐位不变，纯 CPU 补丁的 D2H 排干阻塞净成本 ~37ms 被消除（0.1s 精度计时曾误判为 0） |
 | + bev_pool 包装层快赢（cat 交换/int32 ranks/sort 一次性） | **0.63s（631-639ms）** | 2026-09-18 傍晚；包装 78→48ms（fancy 交换 14→3、int32 ranks 9→5、torch.sort 一次性 33→18、int32 coords gather 7→6）；48 dets / 0.819399 噪声内。坑：int32 直接 sort 落 AICPU 慢 20x（367ms），排序必须 float32。剩余：feats 640MB gather 15ms（kernel 侧索引可消）、sort 18ms（atomic kernel 可消）｜**2026-09-22 勘误：gather 已在 56b982a 删除（过时前提），kernel 侧优化证伪，见 §3** |
 | + 移除 x/y 交换（kernel 改官方约定） | **0.62s（613-618ms）** | 2026-09-18 晚；unum_ops AscendC kernel 回退至 3c7c9bd+官方约定（coord[0]→H），分发器直用原生 [x,y,z,b]；48 dets / max 0.819478 逐位一致 |
+| + voxelize AscendC + bev_pool 单入口 v2 默认 | 0.54s | 2026-09-25/29；voxelize -38ms 被 bev_pool_v2 demo 帧 +42ms 抵消（D=1 tiling 盲区，性能.md §1.2.1） |
+| + bev_pool v1 默认接线（`BEVFUSION_BEV_POOL_IMPL`） | **0.48s（482-485ms）** | 2026-09-30；mmdet3d 侧 env 默认 ascendc=v1，5/5 轮极稳，48 dets / 0.819478 |
+| + Swin ShiftWindowMSA 优化（mask 缓存 + pad/roll 融合） | **0.477s（median 477，20 轮 A/B -9ms）** | 2026-09-30；bit-exact 8/8 形状；`NPU_PATCH_SWIN_SHIFT=0` 可关；Swin 深挖与 FA 路线尸检见 性能.md §3.3.7 |
+| + LiDAR 投影 trash 列向量化（O12） | **0.45s（median 450，25 轮 A/B -31ms）** | 2026-09-30；bit-exact；消 NonZero 11.4ms + Index gather 6.4ms + 6 次 .any() 同步 + CPU zeros/H2D；`NPU_PATCH_LIDAR_PROJ=0` 可关；与 3.3.2/3.3.6 两次失败的区别见 性能.md O12 |
 
 #### 关键修复
 1. **`unum_ops.voxelization_torch` 向量化**（13.8s → 0.37s）：stable argsort(int64) +
@@ -361,7 +370,20 @@ python /root/.agents/skills/ascend-onnx-atc-pipeline/scripts/compare_precision.p
 - `task_time.csv` 字段带内嵌引号和 \t，需 strip("'").strip() 清洗
 - 计算内核（Swin 152ms / spconv 70ms / BEV conv 43ms）远小于数据搬运/布局转换——
   310P 优化主战场是 gather/scatter/sort/小算子风暴，不是 GEMM/Conv
-- torchair（default/full）对当前全 PT 路径无收益（device-bound，1.1s 三模式同速同结果）
+- torchair（default/full）对当前全 PT 路径不可用（**2026-09-30 勘误**：09-18 的"三模式
+  同速无收益"是 demo.py 直调 `model.test_step()` 穿透 `torch.compile` 的接线 bug——
+  编译路径从未执行过，三组数字全是 eager 波动。修复接线（demo.py `run_step` 走
+  `__call__`）后有效测试：eager 467ms/48dets，default 在 GE 转换阶段崩
+  `aten.diagonal ge_converter not implemented`，fullgraph 遇 dynamo 断图必然 Unsupported；
+  断图仅 2 处（numpy 矩阵段），卡死在 torchair aten→GE 转换器覆盖面。结构性障碍与
+  排队/搬运分析详见 性能.md §3.3.8）
+- 官方调度/OS 级优化项 A/B **全部无收益，勿再投入**（2026-09-30/10-08，性能.md §3.3.9）：
+  `TASK_QUEUE_ENABLE` L0≈L1≈L2 同速（451±2ms）、`PER_STREAM_QUEUE` 轻微负向、
+  `COMBINED_ENABLE`/tcmalloc/malloc 大页全中性——单进程空载 demo 是 device-bound，
+  host 侧旋钮无时间可回收，独立复证 §3.3.8。约束核查：`TORCH_NPU_LAZY_FUSION`
+  （DVM 融合）官方仅支持 A2/A3，**310P 排除**；`CPU_AFFINITY_CONF` 官方列表不含
+  推理系列但 **310P 实测会激活**（线程被钉核）——支持列表是验证范围不是硬 gating，
+  无收益仅因本场景 host 不是瓶颈。唯一未测场景：8 进程全量评测（CPU 争用真实存在）
 
 ### 16. UNUM_SPCONV2=1（spconv v2 全融合 AscendC 内核）demo 实测（2026-09-29）
 
