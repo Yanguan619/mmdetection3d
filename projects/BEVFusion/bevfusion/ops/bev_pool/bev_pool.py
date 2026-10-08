@@ -19,6 +19,12 @@ try:
 except (ImportError, ModuleNotFoundError, ValueError):
     _HAS_MX_DRIVING_EXT = False
 
+# unum_ops 单入口 impl 选择（auto 分发下用哪个 AscendC 内核），env 可覆盖：
+#   ascendc（默认）= v1 原子加（demo 帧形状段级 23.1ms）
+#   ascendc_v2     = 全融合 kernel（同形状 65.4ms，tiling 未覆盖 D=1 形状，
+#                    段级 A/B 见 demo/npu/性能.md §1.2.1）
+_BEV_POOL_IMPL = os.environ.get('BEVFUSION_BEV_POOL_IMPL', 'ascendc')
+
 
 class QuickCumsum(torch.autograd.Function):
 
@@ -176,7 +182,10 @@ def _bev_pool_ascendc(feats, coords, B, D, H, W):
     # y→W，输出 out[b,z,x,y]），分发器不再交换 x/y 列。
     # 历史注记：旧 kernel 把 coord[0] 当 W 轴（by*gridW+bx），此处曾用 cat
     # 切片交换（2.9ms；fancy 索引版 14ms 禁用）补偿。
-    return _bev_pool_ascend(feats, coords, B, D, H, W).out
+    # 2026-09-30 起 unum_ops 收敛单入口 bev_pool(impl=...)（包级默认 ascendc_v2），
+    # 此处显式传 impl 锁定内核：demo 帧形状 v1 原子加 23.1ms 显著快于 v2 全融合
+    # 65.4ms（v2 tiling 未覆盖 D=1 形状，段级 A/B 见 性能.md §1.2.1）。
+    return _bev_pool_ascend(feats, coords, B, D, H, W, impl=_BEV_POOL_IMPL).out
 
 
 def _bev_pool_mxdriving(feats, coords, B, D, H, W):
@@ -211,10 +220,13 @@ def bev_pool(feats, coords, B, D, H, W):
                 "请先 `pip install mx-driving`（cp311/aarch64 wheel 含 "
                 "ascend310p 预编译 bev_pool_v3 内核）。")
         return _bev_pool_mxdriving(feats, coords, B, D, H, W)
-    # auto：优先 unum_ops 原子加 AscendC（2026-09-20 重写：免排序 scatter，
-    # host 预乘元素偏移 + kernel 逐点 SetAtomicAdd + OOB 零写流量跳过；
-    # 1.84M 点实测 31.4ms，max_abs 4.8e-7，均优于 mx_driving 34.4ms/1.95e-5）；
-    # 其次 mx_driving（DrivingSDK 官方 bev_pool_v3，原子累加 34ms）；
+    # auto：优先 unum_ops AscendC（单入口 bev_pool(impl=...)，impl 由
+    # BEVFUSION_BEV_POOL_IMPL 选择，默认 'ascendc' = v1 原子加——2026-09-30 段级 A/B：
+    # demo 帧形状（D=1/360×360, N=2.0M, C=80）v1 23.1ms vs ascendc_v2 全融合 65.4ms
+    # （v2 tiling 未覆盖 D=1 形状，见 性能.md §1.2.1），E2E 0.50s vs 0.54s；
+    # 2026-09-20 重写：免排序 scatter，host 预乘元素偏移 + kernel 逐点 SetAtomicAdd +
+    # OOB 零写流量跳过，max_abs 4.8e-7）；
+    # 其次 mx_driving（DrivingSDK 官方 bev_pool_v3，原子累加 ~25ms）；
     # 都不可用时回退 QuickCumsum（~400ms）。
     # NPU 大 int32 坑：≥2^28 的 int32 过 torch.where/比较会被内部 FP32 量化，
     # unum_ops wrapper 已改用小值域判定（坐标逐维比较 + b→B 映射）规避。

@@ -34,15 +34,19 @@ sys.path.insert(0, str(_npu_patch.parent))
 from npu_patches import (
     patch_get_geometry_cpu,
     patch_get_geometry_overlap,
+    patch_lidar_proj_trash,
     patch_mha_with_flash_attention,
     patch_spconv_unum_ops,
     patch_swin_patchmerging,
+    patch_swin_shift_optimizations,
 )
 
 patch_spconv_unum_ops()  # 用 unum_ops spconv 替换官方 spconv-cu114（mmdet3d 加载后）
 patch_swin_patchmerging()
+patch_swin_shift_optimizations()  # ShiftWindowMSA mask 缓存 + pad/roll 融合 (bit-exact)
 patch_get_geometry_cpu()  # NPU_GEOMETRY_ON_NPU=1: 几何回 NPU（精度降级）
 patch_get_geometry_overlap()  # numpy 副本 CPU 预计算，省掉 D2H 排干（无重叠）
+patch_lidar_proj_trash()  # LiDAR 投影 trash 列向量化 (bit-exact, 段 -20ms)
 patch_mha_with_flash_attention()
 
 
@@ -106,6 +110,19 @@ def build_data(model, pcd_path, img_dir, ann_path):
     # pipeline 输出的单样本 dict，collate 后用于后续 warmup / 计时循环。
     _, data = inference_multi_modality_detector(model, pcd_path, img_dir, ann_path, cam_type="all")
     return pseudo_collate([data])
+
+
+def run_step(model, data):
+    """test_step 等价调用（data_preprocessor + forward(mode='predict')）。
+
+    torch.compile 只拦截 __call__/forward，直接调 model.test_step() 会经
+    __getattr__ 穿透到未编译模块——编译路径根本不执行。2026-09-30 勘误：
+    09-18 与 09-30 两轮"torchair 三模式同速"结论均为该 bug 下的 eager 空跑。
+    编译模式必须经 model(**inputs) 走 __call__；eager 下与 test_step 逐语句等价
+    （mmengine BaseModel.test_step 源码即 data_preprocessor + self(**data, mode='predict')）。
+    """
+    prep = model.data_preprocessor(data, False)
+    return model(**prep, mode="predict")
 
 
 def post_process(result, model, args):
@@ -202,7 +219,7 @@ def main(args):
     _t4 = time.time()
     with torch.no_grad():
         for _ in range(max(1, args.warmup)):
-            _ = model.test_step(collate_data)
+            _ = run_step(model, collate_data)
     if args.device.startswith("cuda"):
         torch.cuda.synchronize()
     elif args.device.startswith("npu"):
@@ -214,7 +231,7 @@ def main(args):
     for _round in range(args.loop):
         _t5 = time.time()
         with torch.no_grad():
-            result = model.test_step(collate_data)
+            result = run_step(model, collate_data)
         if args.device.startswith("cuda"):
             torch.cuda.synchronize()
         elif args.device.startswith("npu"):

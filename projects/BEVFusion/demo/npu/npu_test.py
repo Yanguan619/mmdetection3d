@@ -103,11 +103,15 @@ def main():
     from npu_patches import (
         patch_get_geometry_cpu,
         patch_get_geometry_overlap,
+        patch_lidar_proj_trash,
         patch_swin_patchmerging,
+        patch_swin_shift_optimizations,
     )
     patch_swin_patchmerging()
+    patch_swin_shift_optimizations()  # mask 缓存 + pad/roll 融合 (bit-exact, -9ms/帧)
     patch_get_geometry_cpu()
     patch_get_geometry_overlap()  # numpy 副本 CPU 预计算，省 D2H 排干 ~37ms/帧（几何逐位不变）
+    patch_lidar_proj_trash()  # LiDAR 投影 trash 列向量化 (bit-exact, 段 -20ms)
 
     from mmengine.registry import init_default_scope
     from mmengine.runner import Runner

@@ -2,7 +2,7 @@
 
 BEVFusion 在昇腾 310P 上的全 PyTorch 推理 demo 与全量评测工具链。
 
-- 性能结论：**0.54s/帧**（`[TIME] inference` = `model.test_step` 纯前向，不含数据/权重加载；2026-09-21 npu:0 实测；npu:7 共享设备噪声 ~0.70s，A/B 须同卡同时段）
+- 性能结论：**0.45s/帧**（`[TIME] inference` = `model.test_step` 纯前向，不含数据/权重加载；2026-09-30 npu:7 空载 25 轮 median 450ms（bev_pool v1 默认 + Swin shift 优化 + LiDAR 投影 trash 列向量化）；共享争抢时 +0.15~0.2s，A/B 须同卡同时段）
 - 精度结论：**全量 6019 帧 val 集 mAP 68.74 / NDS 71.49**，与官方 GPU 基线一致（100.2% / 100.1%）
 - 详细分析见 [`性能.md`](性能.md)（profiling + 优化轨迹）与 [`精度.md`](精度.md)（验证记录 + 补丁清单）
 
@@ -33,7 +33,7 @@ python projects/BEVFusion/demo/npu/demo.py \
 | `--warmup` | `2` | 预热轮数（吸收 JIT 编译 + 数据加载） |
 | `--loop` | `1` | 计时轮数（每轮跑一次 `test_step`，打印逐轮耗时） |
 | `--out-json` | `/tmp/cuda_unumops_results.json` | 检测结果 JSON 输出 |
-| `--compile` | `off` | torchair 编译模式 `off/full/default`（310P 上 eager 即可，无收益） |
+| `--compile` | `off` | torchair 编译模式 `off/full/default`（310P 上 torchair 不可用——GE 转换器缺算子，接线已修复为响亮失败，详见 性能.md §3.3.8；默认 eager） |
 
 输出示例：
 
@@ -52,10 +52,39 @@ python projects/BEVFusion/demo/npu/demo.py \
 `demo.py` 无 `--bev-pool-backend` 参数，用环境变量 `BEVFUSION_BEV_POOL_BACKEND` 控制：
 
 ```bash
-BEVFUSION_BEV_POOL_BACKEND=auto        python ...   # 默认：CUDA→unum_ops 原子加→mx_driving→QuickCumsum
+BEVFUSION_BEV_POOL_BACKEND=auto        python ...   # 默认：unum_ops AscendC→mx_driving→QuickCumsum
 BEVFUSION_BEV_POOL_BACKEND=torch       python ...   # QuickCumsum（精度参照）
 BEVFUSION_BEV_POOL_BACKEND=scatter     python ...   # scatter_add（bit-exact，AICPU 慢）
 BEVFUSION_BEV_POOL_BACKEND=mx_driving  python ...   # DrivingSDK bev_pool_v3（对照）
+```
+
+auto 模式下用哪个 unum_ops AscendC 内核由 `BEVFUSION_BEV_POOL_IMPL` 选择
+（2026-09-30 起默认 `ascendc` = v1 原子加，demo 帧形状段级 23.1ms）：
+
+```bash
+BEVFUSION_BEV_POOL_IMPL=ascendc     python ...   # 默认：v1 原子加（demo 帧最快）
+BEVFUSION_BEV_POOL_IMPL=ascendc_v2  python ...   # 全融合 kernel（demo 帧 D=1 形状 65.4ms，
+                                                 #  段级 A/B 见 性能.md §1.2.1）
+```
+
+## Swin shift 路径优化（bit-exact，默认开启）
+
+`patch_swin_shift_optimizations()`（npu_patches.py）：ShiftWindowMSA 的 attn mask
+全局缓存 + pad/roll 四切片装配融合，8/8 形状逐位相等，-9ms/帧。A/B 对照可关：
+
+```bash
+NPU_PATCH_SWIN_SHIFT=0    python ...   # 关闭（回退 mmdet 原始路径）
+```
+
+## LiDAR 投影 trash 列向量化（bit-exact，默认开启）
+
+`patch_lidar_proj_trash()`（npu_patches.py）：`BaseDepthTransform.forward` 的 b×6
+相机循环改为 trash 列路由（无效点 → (0, W) 格，逐相机全量赋值），消掉布尔索引
+gather（NonZero AICPU）与每相机 `.any()` 同步，depth 图逐位相等，E2E -31ms
+（481→450ms，2026-09-30）。A/B 对照可关：
+
+```bash
+NPU_PATCH_LIDAR_PROJ=0    python ...   # 关闭（回退 mmdet 原始路径）
 ```
 
 ## 全量评测（6019 val 帧）
@@ -99,5 +128,5 @@ python projects/BEVFusion/demo/npu/npu_eval.py \
 | `run_npu_test_chunks.sh` | 分块驱动 + 合并脚本 |
 | `npu_eval.py` | NuScenesEval（NDS/mAP/ATE/ASE/AOE/AVE/AAE） |
 | `npu_patches.py` | NPU 精度/性能补丁（spconv 替换、Swin、get_geometry） |
-| `性能.md` | 性能分析详情（profiling、优化轨迹 57s→0.54s、bev_pool A/B） |
+| `性能.md` | 性能分析详情（profiling、优化轨迹 57s→0.45s、bev_pool A/B、Swin 深挖） |
 | `精度.md` | 精度验证详情（全量/单帧/补丁清单/复测方法） |

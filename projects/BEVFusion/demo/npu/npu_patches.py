@@ -125,6 +125,161 @@ def patch_swin_patchmerging():
     PatchMerging.forward = _patched_patchmerging_forward
 
 
+# ─── Patch 1b: ShiftWindowMSA shift 路径优化（2026-09-30）──────────────────────
+# 实测（npu:7，stage0 形状 6x70x182x96）：
+#   torch.roll          2.31ms   F.pad 0.67ms   mask 构建链 1.48ms
+# 每个 shift 块每帧：pad+roll（2 次全帧拷贝）+ reverse roll+contiguous（又 2 次）
+# + mask 重算；6 个 shift 块合计 ~27ms。
+# 两项优化均 bit-exact（数值相同，仅拷贝路径不同）：
+#   1) attn_mask 是 (H_pad, W_pad, window, shift) 的纯形状函数 -> 全局缓存，
+#      省去每帧重算（1.48ms x 6）。
+#   2) pad(右/下)+roll(-s) 代数等价于 4 切片装配（主块+列/行/角卷绕），
+#      前向省一次全帧拷贝；反向 roll(+s)+slice+contiguous（2 次拷贝）同样
+#      等价于 4 切片装配（1 次拷贝）。成立条件 pad_b>=s 且 pad_r>=s（本模型
+#      四个 stage 的 pad 为 6/6,3/3,5/5,6/6，shift=3，均满足）；不满足时
+#      严格回退原始路径（不静默出错）。
+
+_SWIN_ATTN_MASK_CACHE = {}
+
+
+def _swin_cached_attn_mask(self, H_pad, W_pad, device):
+    """mmdet ShiftWindowMSA.forward 220-240 行的等价实现 + 全局缓存。"""
+    key = (str(device), H_pad, W_pad, self.window_size, self.shift_size)
+    mask = _SWIN_ATTN_MASK_CACHE.get(key)
+    if mask is not None:
+        return mask
+    img_mask = torch.zeros((1, H_pad, W_pad, 1))
+    h_slices = (slice(0, -self.window_size),
+                slice(-self.window_size, -self.shift_size),
+                slice(-self.shift_size, None))
+    w_slices = (slice(0, -self.window_size),
+                slice(-self.window_size, -self.shift_size),
+                slice(-self.shift_size, None))
+    cnt = 0
+    for h in h_slices:
+        for w in w_slices:
+            img_mask[:, h, w, :] = cnt
+            cnt += 1
+    ws = self.window_size
+    mw = img_mask.view(1, H_pad // ws, ws, W_pad // ws, ws, 1).permute(
+        0, 1, 3, 2, 4, 5).reshape(-1, ws * ws)
+    attn_mask = mw.unsqueeze(1) - mw.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)
+                                      ).masked_fill(attn_mask == 0, float(0.0))
+    attn_mask = attn_mask.to(device)
+    _SWIN_ATTN_MASK_CACHE[key] = attn_mask
+    return attn_mask
+
+
+def _swin_fused_pad_roll(x, H, W, H_pad, W_pad, s):
+    """F.pad(右/下) + roll(-s,-s) 的单次装配等价（要求 pad_b>=s 且 pad_r>=s）。"""
+    B, _, _, C = x.shape
+    out = x.new_zeros((B, H_pad, W_pad, C))
+    out[:, 0:H - s, 0:W - s] = x[:, s:H, s:W]
+    out[:, 0:H - s, W_pad - s:W_pad] = x[:, s:H, 0:s]
+    out[:, H_pad - s:H_pad, 0:W - s] = x[:, 0:s, s:W]
+    out[:, H_pad - s:H_pad, W_pad - s:W_pad] = x[:, 0:s, 0:s]
+    return out
+
+
+def _swin_fused_roll_unpad(sh, H, W, H_pad, W_pad, s):
+    """roll(+s,+s) + [:, :H, :W] + contiguous() 的单次装配等价。"""
+    B, _, _, C = sh.shape
+    out = sh.new_empty((B, H, W, C))
+    out[:, s:H, s:W] = sh[:, 0:H - s, 0:W - s]
+    out[:, s:H, 0:s] = sh[:, 0:H - s, W_pad - s:W_pad]
+    out[:, 0:s, s:W] = sh[:, H_pad - s:H_pad, 0:W - s]
+    out[:, 0:s, 0:s] = sh[:, H_pad - s:H_pad, W_pad - s:W_pad]
+    return out
+
+
+def _patched_shiftwinmsa_forward(self, query, hw_shape):
+    import torch.nn.functional as F
+
+    from mmdet.models.backbones.swin import _roll_onnx_compat
+
+    B, L, C = query.shape
+    H, W = hw_shape
+    assert L == H * W, 'input feature has wrong size'
+    query = query.view(B, H, W, C)
+
+    pad_r = (self.window_size - W % self.window_size) % self.window_size
+    pad_b = (self.window_size - H % self.window_size) % self.window_size
+    H_pad, W_pad = H + pad_b, W + pad_r
+    s = self.shift_size
+    # 融合路径成立条件：shift 块 + 两个方向 pad 都 >= shift + 图像大于 shift
+    fused = s > 0 and pad_b >= s and pad_r >= s and H > s and W > s
+
+    if fused:
+        shifted_query = _swin_fused_pad_roll(query, H, W, H_pad, W_pad, s)
+        attn_mask = _swin_cached_attn_mask(self, H_pad, W_pad, query.device)
+    else:
+        query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
+        H_pad, W_pad = query.shape[1], query.shape[2]
+        if s > 0:
+            shifted_query = _roll_onnx_compat(
+                query, shifts=(-s, -s), dims=(1, 2))
+            img_mask = torch.zeros((1, H_pad, W_pad, 1), device=query.device)
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = self.window_partition(img_mask)
+            mask_windows = mask_windows.view(
+                -1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0,
+                                              float(-100.0)).masked_fill(
+                                                  attn_mask == 0, float(0.0))
+        else:
+            shifted_query = query
+            attn_mask = None
+
+    query_windows = self.window_partition(shifted_query)
+    query_windows = query_windows.view(-1, self.window_size**2, C)
+    attn_windows = self.w_msa(query_windows, mask=attn_mask)
+    attn_windows = attn_windows.view(-1, self.window_size,
+                                     self.window_size, C)
+    shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+
+    if fused:
+        x = _swin_fused_roll_unpad(shifted_x, H, W, H_pad, W_pad, s)
+    else:
+        if s > 0:
+            x = _roll_onnx_compat(
+                shifted_x, shifts=(s, s), dims=(1, 2))
+        else:
+            x = shifted_x
+        if pad_r > 0 or pad_b:
+            x = x[:, :H, :W, :].contiguous()
+
+    x = x.view(B, H * W, C)
+    x = self.drop(x)
+    return x
+
+
+def patch_swin_shift_optimizations():
+    """ShiftWindowMSA：mask 缓存 + pad/roll 融合（bit-exact，见模块注释）。
+
+    env 开关 NPU_PATCH_SWIN_SHIFT=0 可关闭（A/B 对照用）。
+    """
+    if os.environ.get("NPU_PATCH_SWIN_SHIFT", "1") == "0":
+        print("[npu_patches] ShiftWindowMSA 优化已通过 NPU_PATCH_SWIN_SHIFT=0 关闭")
+        return
+    from mmdet.models.backbones.swin import ShiftWindowMSA
+
+    ShiftWindowMSA.forward = _patched_shiftwinmsa_forward
+    print("[npu_patches] ShiftWindowMSA: mask 缓存 + pad/roll 融合 (bit-exact)")
+
+
+
 # ─── Patch 2: get_geometry on CPU ──────────────────────────────────────────────
 # NPU fp32 bmm internally computes at reduced precision (rel ~4e-4, fp16-like
 # Cube inputs).  The view-transform geometry chain (frustum -> undo post-rot ->
@@ -191,6 +346,35 @@ _GEOM_INPUT_STASH = {}  # extract_feat 入口留存的 numpy 标定矩阵（每�
 _GEOM_STASH_KEYS = ("lidar2img", "cam2img", "cam2lidar", "img_aug_matrix", "lidar_aug_matrix")
 
 
+def _stash_geom_inputs(batch_inputs_dict, batch_input_metas):
+    """extract_feat 入口留存 metas 的 numpy 矩阵副本（每帧覆盖，失败清 stash）。
+
+    numpy 互操作段，标记为 dynamo 禁区（torchair 图捕获时在此干净断图、
+    eager 执行本段；无 dynamo 时该标记零开销）。见 patch_get_geometry_overlap。
+    """
+    try:
+        imgs = (batch_inputs_dict or {}).get("imgs", None)
+        if torch.is_tensor(imgs) and imgs.device.type == "npu" and batch_input_metas:
+            m = {k: [] for k in _GEOM_STASH_KEYS}
+            for meta in batch_input_metas:
+                if not isinstance(meta, dict):
+                    break
+                m["lidar2img"].append(np.asarray(meta["lidar2img"]))
+                m["cam2img"].append(np.asarray(meta["cam2img"]))
+                m["cam2lidar"].append(np.asarray(meta["cam2lidar"]))
+                m["img_aug_matrix"].append(np.asarray(meta.get("img_aug_matrix", np.eye(4))))
+                m["lidar_aug_matrix"].append(
+                    np.asarray(meta.get("lidar_aug_matrix", np.eye(4)))
+                )
+            else:
+                _GEOM_INPUT_STASH["np"] = {k: np.stack(v) for k, v in m.items()}
+    except Exception:
+        _GEOM_INPUT_STASH.pop("np", None)  # 留存失败 → 回退即时路径
+
+
+_stash_geom_inputs = torch._dynamo.disable(_stash_geom_inputs)
+
+
 def patch_get_geometry_overlap():
     """CPU 几何计算省掉 D2H 排干（在 patch_get_geometry_cpu 之后调用）。
 
@@ -212,28 +396,12 @@ def patch_get_geometry_overlap():
         return
 
     # hook 1: extract_feat 入口留存 metas 的 numpy 矩阵副本
-    # （矩阵原本就是从这里 imgs.new_tensor 上 NPU 的，numpy 副本零成本）
+    # （矩阵原本就是从这里 imgs.new_tensor 上 NPU 的，numpy 副本零成本；
+    #  stash 段为 dynamo 禁区，torchair 图捕获时在此断图）
     _orig_extract_feat = BEVFusion.extract_feat
 
     def _extract_feat_stash(self, batch_inputs_dict, batch_input_metas, **kwargs):
-        try:
-            imgs = (batch_inputs_dict or {}).get("imgs", None)
-            if torch.is_tensor(imgs) and imgs.device.type == "npu" and batch_input_metas:
-                m = {k: [] for k in _GEOM_STASH_KEYS}
-                for meta in batch_input_metas:
-                    if not isinstance(meta, dict):
-                        break
-                    m["lidar2img"].append(np.asarray(meta["lidar2img"]))
-                    m["cam2img"].append(np.asarray(meta["cam2img"]))
-                    m["cam2lidar"].append(np.asarray(meta["cam2lidar"]))
-                    m["img_aug_matrix"].append(np.asarray(meta.get("img_aug_matrix", np.eye(4))))
-                    m["lidar_aug_matrix"].append(
-                        np.asarray(meta.get("lidar_aug_matrix", np.eye(4)))
-                    )
-                else:
-                    _GEOM_INPUT_STASH["np"] = {k: np.stack(v) for k, v in m.items()}
-        except Exception:
-            _GEOM_INPUT_STASH.pop("np", None)  # 留存失败 → 回退即时路径
+        _stash_geom_inputs(batch_inputs_dict, batch_input_metas)
         return _orig_extract_feat(self, batch_inputs_dict, batch_input_metas, **kwargs)
 
     BEVFusion.extract_feat = _extract_feat_stash
@@ -320,6 +488,114 @@ def patch_get_geometry_overlap():
     BEVFusion.extract_img_feat = _extract_img_feat_early
     BEVFusion._npu_geom_overlap_patched = True
     print("[npu_patches] get_geometry CPU 预计算: extract_feat 留存 numpy 矩阵副本（省 D2H 排干）")
+
+
+# ─── Patch 4: LiDAR 投影 trash 列向量化 ───────────────────────────────────────
+# 原始 BaseDepthTransform.forward 的 b×6 相机循环是 NPU 反模式组合：
+#   每相机一次 .any() 同步（排干队列）+ 布尔索引 gather（NonZero AICPU
+#   11.4ms + Index 6.4ms，op_summary 实测）+ advanced-index scatter，
+#   外加 depth 的 CPU zeros + 4.3MB H2D。段实测 44.7ms（独立探针）。
+# 改法：depth 直接在设备上分配 (B, C, 1, H, W+1)，无效点统一路由到 (0, W)
+# trash 格（NaN/越界坐标经 mask 比较自然落 trash），逐相机全量 index_put_
+# ——保持每相机内点序，重复单元 last-wins 与原始逐位一致（bit-exact 验证
+# 过）；末尾 narrow[..., :W] 丢弃 trash 列。数学链逐语句不动。
+# 段实测 44.7→24.8ms（-20ms）；env NPU_PATCH_LIDAR_PROJ=0 关闭。
+
+
+def patch_lidar_proj_trash():
+    """LiDAR 投影（点云→稀疏深度图）trash 列向量化，bit-exact，-20ms/帧。
+
+    env 开关 NPU_PATCH_LIDAR_PROJ=0 可关闭（A/B 对照用）；非 NPU 设备
+    运行时自动回退原始实现。
+    """
+    if os.environ.get("NPU_PATCH_LIDAR_PROJ", "1") == "0":
+        print("[npu_patches] LiDAR 投影 trash 优化已通过 NPU_PATCH_LIDAR_PROJ=0 关闭")
+        return
+    from projects.BEVFusion.bevfusion.depth_lss import BaseDepthTransform
+
+    if getattr(BaseDepthTransform, "_npu_lidar_proj_patched", False):
+        return
+
+    _orig_forward = BaseDepthTransform.forward
+
+    def _trash_forward(
+        self, img, points, lidar2image, cam_intrinsic, camera2lidar,
+        img_aug_matrix, lidar_aug_matrix, metas, **kwargs,
+    ):
+        if not torch.is_tensor(points[0]) or points[0].device.type != "npu":
+            return _orig_forward(
+                self, img, points, lidar2image, cam_intrinsic, camera2lidar,
+                img_aug_matrix, lidar_aug_matrix, metas, **kwargs,
+            )
+        intrins = cam_intrinsic[..., :3, :3]
+        post_rots = img_aug_matrix[..., :3, :3]
+        post_trans = img_aug_matrix[..., :3, 3]
+        camera2lidar_rots = camera2lidar[..., :3, :3]
+        camera2lidar_trans = camera2lidar[..., :3, 3]
+
+        batch_size = len(points)
+        H_img, W_img = self.image_size
+        depth = torch.zeros(
+            batch_size, img.shape[1], 1, H_img, W_img + 1,
+            device=points[0].device,
+        )
+        for b in range(batch_size):
+            cur_coords = points[b][:, :3]
+            cur_img_aug_matrix = img_aug_matrix[b]
+            cur_lidar_aug_matrix = lidar_aug_matrix[b]
+            cur_lidar2image = lidar2image[b]
+
+            # inverse aug
+            cur_coords -= cur_lidar_aug_matrix[:3, 3]
+            cur_coords = torch.inverse(cur_lidar_aug_matrix[:3, :3]).matmul(
+                cur_coords.transpose(1, 0))
+            # lidar2image
+            cur_coords = cur_lidar2image[:, :3, :3].matmul(cur_coords)
+            cur_coords += cur_lidar2image[:, :3, 3].reshape(-1, 3, 1)
+            # get 2d coords
+            dist = cur_coords[:, 2, :]
+            cur_coords[:, 2, :] = torch.clamp(cur_coords[:, 2, :], 1e-5, 1e5)
+            cur_coords[:, :2, :] /= cur_coords[:, 2:3, :]
+            # imgaug
+            cur_coords = cur_img_aug_matrix[:, :3, :3].matmul(cur_coords)
+            cur_coords += cur_img_aug_matrix[:, :3, 3].reshape(-1, 3, 1)
+            cur_coords = cur_coords[:, :2, :].transpose(1, 2)
+            # normalize coords for grid sample: [..., [1, 0]] -> (y, x)
+            cur_coords = cur_coords[..., [1, 0]]
+
+            y = cur_coords[..., 0]
+            x = cur_coords[..., 1]
+            valid = (y >= 0) & (y < H_img) & (x >= 0) & (x < W_img)
+            # 无效点 → (0, W) trash 格（单格重复写无影响，narrow 后丢弃）
+            yi = torch.where(valid, y, torch.zeros_like(y)).long()
+            xi = torch.where(valid, x, torch.full_like(x, float(W_img))).long()
+            flat = yi * (W_img + 1) + xi
+            dd = torch.where(valid, dist, torch.zeros_like(dist))
+            # 逐相机全量 scatter：保持相机内点序 → 重复单元 last-wins 与原始一致
+            for c in range(cur_coords.shape[0]):
+                depth[b, c].view(-1)[flat[c]] = dd[c]
+
+        depth = depth[..., :W_img].contiguous()
+
+        extra_rots = lidar_aug_matrix[..., :3, :3]
+        extra_trans = lidar_aug_matrix[..., :3, 3]
+        geom = self.get_geometry(
+            camera2lidar_rots,
+            camera2lidar_trans,
+            intrins,
+            post_rots,
+            post_trans,
+            extra_rots=extra_rots,
+            extra_trans=extra_trans,
+        )
+
+        x = self.get_cam_feats(img, depth)
+        x = self.bev_pool(geom, x)
+        return x
+
+    BaseDepthTransform.forward = _trash_forward
+    BaseDepthTransform._npu_lidar_proj_patched = True
+    print("[npu_patches] LiDAR 投影 trash 列向量化 (bit-exact, 段 -20ms)")
 
 
 def _compute_geometry_cpu(vt, rots, trans, intrins, post_rots, post_trans, **kwargs):
